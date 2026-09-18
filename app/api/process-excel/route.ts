@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// Allow up to 20 minutes for local dev processing of large workbooks
-export const maxDuration = 1200;
+export const maxDuration = 60;
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
