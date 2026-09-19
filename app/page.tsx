@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useState, useRef, useMemo } from "react";
-import { parseWorkbook, exportWorkbook } from "@/lib/excel-utils";
+import { parseWorkbook } from "@/lib/excel-utils";
 import { applyMacro } from "@/lib/macros";
 import {
   MacroOp, MacroResult, RowData, SheetData,
@@ -76,8 +76,15 @@ export default function Home() {
         setExporting(false);
         setExportMsg("⬇ Export Processed");
       };
-      // Transfer the buffer to the worker (zero-copy)
-      worker.postMessage({ buffer: buf }, [buf]);
+      // Pass red-row numbers derived from the already-loaded display data.
+      // excel.worker.js already detected them correctly; re-using that result
+      // avoids duplicating (and potentially mismatching) CF / fill logic.
+      const redBySheet: Record<string, number[]> = {};
+      for (const sheet of sheets) {
+        const redRows = sheet.rows.filter(r => r.isRed).map(r => r.originalRow);
+        if (redRows.length > 0) redBySheet[sheet.name] = redRows;
+      }
+      worker.postMessage({ buffer: buf, redBySheet }, [buf]);
     }).catch((e) => {
       alert("Failed to read file: " + String(e));
       setExporting(false);
@@ -180,6 +187,11 @@ export default function Home() {
         const cmp = String(av).localeCompare(String(bv), undefined, { numeric: true });
         return sortDir === "asc" ? cmp : -cmp;
       });
+    } else {
+      // Default view mirrors the export: red rows first, original order preserved
+      // within each group. Partitioning keeps this O(n) over ~84k rows.
+      const red = rows.filter((r) => r.isRed);
+      if (red.length) rows = [...red, ...rows.filter((r) => !r.isRed)];
     }
     return rows;
   }, [currentSheet, search, sortCol, sortDir]);
@@ -259,7 +271,6 @@ export default function Home() {
         >
           {exportMsg}
         </button>
-        <button onClick={() => workbook && exportWorkbook(sheets, workbook.fileName)} style={{ background: "#2563eb", color: "#fff", border: "none", borderRadius: 6, padding: "6px 14px", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>Export Excel</button>
         <input ref={inputRef} type="file" accept=".xlsx,.xls,.xlsm,.csv" style={{ display: "none" }} onChange={onFileChange} />
       </header>
 
