@@ -80,11 +80,14 @@ export default function Home() {
       // excel.worker.js already detected them correctly; re-using that result
       // avoids duplicating (and potentially mismatching) CF / fill logic.
       const redBySheet: Record<string, number[]> = {};
+      const dividerBySheet: Record<string, number[]> = {};
       for (const sheet of sheets) {
         const redRows = sheet.rows.filter(r => r.isRed).map(r => r.originalRow);
         if (redRows.length > 0) redBySheet[sheet.name] = redRows;
+        const dividerRows = sheet.rows.filter(r => r.isDivider).map(r => r.originalRow);
+        if (dividerRows.length > 0) dividerBySheet[sheet.name] = dividerRows;
       }
-      worker.postMessage({ buffer: buf, redBySheet }, [buf]);
+      worker.postMessage({ buffer: buf, redBySheet, dividerBySheet }, [buf]);
     }).catch((e) => {
       alert("Failed to read file: " + String(e));
       setExporting(false);

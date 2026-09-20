@@ -20,11 +20,13 @@ function xlClean(v) {
   if (typeof v !== 'string') return v;
   return v.split('').filter(ch => ch.charCodeAt(0) >= 32).join('');
 }
+// A letter is any Unicode letter (Python str.isalpha()): "maría" → "María".
+const LETTER_RE = /\p{L}/u;
 function xlProper(v) {
   if (typeof v !== 'string') return v;
   let r = '', prev = false;
   for (const ch of v) {
-    if (/[a-zA-Z]/.test(ch)) { r += prev ? ch.toLowerCase() : ch.toUpperCase(); prev = true; }
+    if (LETTER_RE.test(ch)) { r += prev ? ch.toLowerCase() : ch.toUpperCase(); prev = true; }
     else { r += ch; prev = false; }
   }
   return r;
@@ -116,43 +118,57 @@ function parseSharedStrings(xml) {
   return strings;
 }
 
-// Apply capital-states to ALL shared strings (global text substitution, safe).
-// Fix state abbreviations in a single string: " ca " → " CA ", etc.
-function capStatesStr(s) {
-  if (!s) return s;
-  let ns = s;
-  for (const code of STATES) {
-    const find = ` ${code} `;
-    if (ns.toLowerCase().includes(find.toLowerCase()) && !ns.includes(find)) {
-      ns = ns.replace(new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'gi'), find);
+// Divider (section-break) rows: ≥3 cells holding a bare date like "8.1.22".
+// Section boundaries for the red-to-top sort; matches excel.worker.js.
+const DIVIDER_DATE_RE = /^\s*\d{1,2}\.\d{1,2}\.\d{2,4}\s*$/;
+function detectDividerRows(sheetXml, ss) {
+  const div = new Set();
+  let p = 0;
+  for (;;) {
+    const r = nextRow(sheetXml, p);
+    if (!r) break;
+    p = r.end;
+    if (r.selfClose) continue;
+    const rnM = sheetXml.slice(r.open, r.bodyStart).match(/\br="(\d+)"/);
+    if (!rnM) continue;
+    let n = 0;
+    for (const c of parseCells(sheetXml.slice(r.bodyStart, r.bodyEnd))) {
+      const v = getCellValue(c, ss);
+      if (v != null && DIVIDER_DATE_RE.test(String(v))) n++;
     }
+    if (n >= 3) div.add(+rnM[1]);
   }
-  return ns;
+  return div;
 }
 
-function applyCapStates(strings) {
-  const changed = new Map(); // idx -> newStr
-  for (let i = 0; i < strings.length; i++) {
-    const s = strings[i];
-    if (!s) continue;
-    const ns = capStatesStr(s);
-    if (ns !== s) changed.set(i, ns);
-  }
-  return changed;
+// ── Number-format lookup (to skip date-formatted phone cells) ──────────────
+const BUILTIN_DATE_FMT_IDS = new Set([14,15,16,17,18,19,20,21,22,45,46,47]);
+function parseNumFmtCodes(sx) {
+  const map = {};
+  const b = sx.match(/<numFmts[^>]*>([\s\S]*?)<\/numFmts>/);
+  if (b) for (const m of b[1].matchAll(/<numFmt[^>]*numFmtId="(\d+)"[^>]*formatCode="([^"]*)"/g)) map[+m[1]] = m[2];
+  return map;
 }
-
-function rebuildSSXml(ssXml, changed) {
-  if (changed.size === 0) return ssXml;
-  let i = 0;
-  return ssXml.replace(/<si>([\s\S]*?)<\/si>/g, (match, body) => {
-    const idx = i++;
-    const newStr = changed.get(idx);
-    if (newStr === undefined) return match;
-    if (body.includes('<r>') || body.match(/<r\s/)) return match; // skip rich text
-    const preserve = body.includes('xml:space="preserve"');
-    const tTag = preserve ? `<t xml:space="preserve">${escXml(newStr)}</t>` : `<t>${escXml(newStr)}</t>`;
-    return `<si>${tTag}</si>`;
-  });
+function isDateNumFmt(id, customCodes) {
+  if (BUILTIN_DATE_FMT_IDS.has(id)) return true;
+  const code = customCodes[id];
+  if (!code) return false;
+  const stripped = code.replace(/"[^"]*"/g, '').replace(/\[[^\]]*\]/g, '').replace(/\\./g, '');
+  return /[ymdhs]/i.test(stripped);
+}
+// Style indices whose number format is a date/time format.
+function dateStyleIndexSet(sx) {
+  const custom = parseNumFmtCodes(sx);
+  const out = new Set();
+  const b = sx.match(/<cellXfs[^>]*>([\s\S]*?)<\/cellXfs>/);
+  if (!b) return out;
+  let s = 0;
+  for (const xf of (b[1].match(/<xf\b[^>]*\/?>/g) || [])) {
+    const m = xf.match(/numFmtId="(\d+)"/);
+    if (isDateNumFmt(m ? +m[1] : 0, custom)) out.add(s);
+    s++;
+  }
+  return out;
 }
 
 // ── Conditional-formatting red detection ──────────────────────────────────
@@ -227,7 +243,11 @@ function detectCFRedRows(sheetXml, redDxfIds, ss) {
 
 // ── Sheet processing ───────────────────────────────────────────────────────
 
-function processSheet(xml, ss, doPhone, doDedupe) {
+// Full per-sheet pipeline, matching macros_toolkit.py run-all order:
+//   clean-rep (G) → clean-proper (B E I J clean; D F proper) → capital-states
+//   (own code, every column) → dedupe (on the cleaned values) → format-phone (B).
+// Only cell *values* change; styles.xml / fills / CF are never touched.
+function processSheet(xml, ss, ownCode, doPhone, doDedupe, dateStyleIds) {
   const SD_O = '<sheetData>', SD_C = '</sheetData>';
   const sdS = xml.indexOf(SD_O), sdE = xml.lastIndexOf(SD_C);
   if (sdS === -1 || sdE === -1) return xml;
@@ -255,17 +275,35 @@ function processSheet(xml, ss, doPhone, doDedupe) {
 
     const rowHdr = sd.slice(r.open, r.bodyStart);
     const rowBody = sd.slice(r.bodyStart, r.bodyEnd);
-
-    // Parse cells
     const cells = parseCells(rowBody);
 
-    // Build value array for dedupe
+    // 1. Cleaned string value per shared-string cell: clean/proper by column,
+    //    then capital-states (the sheet's own code) on every column. This is
+    //    both the value dedupe compares and the value written (phone comes last).
+    const cleaned = new Map(); // cell.full -> new string
+    for (const cell of cells) {
+      if (cell.selfClose || cell.isFormula || cell.t !== 's') continue;
+      const vM = cell.inner.match(/<v[^>]*>(\d+)<\/v>/);
+      if (!vM) continue;
+      const idx = parseInt(vM[1]);
+      if (isNaN(idx) || idx >= ss.length) continue;
+      const old = ss[idx];
+      let nv = old;
+      if (cell.col === COL_REP || CLEAN_COLS.has(cell.col)) nv = xlClean(nv);
+      else if (PROPER_COLS.has(cell.col)) nv = xlProper(xlClean(nv));
+      nv = capStateOwn(nv, ownCode);
+      if (nv !== old) cleaned.set(cell.full, nv);
+    }
+
+    // 2. Dedupe on the post-clean / post-capital-states values (Python dedupes
+    //    after capital-states and before format-phone).
     if (doDedupe) {
-      const maxC = cells.reduce((m,c) => Math.max(m, c.col), 0);
+      const maxC = cells.reduce((m, c) => Math.max(m, c.col), 0);
       const vals = new Array(Math.max(maxC, 10)).fill(null);
       for (const c of cells) {
         if (c.col < 1) continue;
-        vals[c.col - 1] = getCellValue(c, ss);
+        vals[c.col - 1] = (c.t === 's' && cleaned.has(c.full))
+          ? cleaned.get(c.full) : getCellValue(c, ss);
       }
       const blank = vals.every(v => v === null || v === '');
       if (!blank) {
@@ -276,14 +314,22 @@ function processSheet(xml, ss, doPhone, doDedupe) {
       }
     }
 
-    // Transform cell values (clean-rep, clean-proper, format-phone)
+    // 3. Write back cleaned strings, then format-phone on numeric column B.
+    //    A date-formatted B cell is left alone (TEXT() would garble its serial —
+    //    macros_toolkit.py op_format_phone skips these deliberately).
     let newBody = rowBody;
     for (const cell of cells) {
       if (cell.selfClose || cell.isFormula) continue;
-      const newVal = transformCell(cell, ss, doPhone);
+      let newVal = null;
+      if (cell.t === 's') {
+        if (cleaned.has(cell.full)) newVal = cleaned.get(cell.full);
+      } else if (doPhone && cell.col === COL_PHONE && cell.t !== 'b' && cell.t !== 'e'
+                 && !dateStyleIds.has(styleIdx(cell))) {
+        const vM = cell.inner.match(/<v[^>]*>([^<]*)<\/v>/);
+        if (vM && vM[1]) { const f = fmtPhone(vM[1]); if (f !== null && f !== vM[1]) newVal = f; }
+      }
       if (newVal === null) continue;
-      const newCell = inlineCell(cell, newVal);
-      newBody = newBody.split(cell.full).join(newCell);
+      newBody = newBody.split(cell.full).join(inlineCell(cell, newVal));
     }
 
     parts.push(rowHdr + newBody + '</row>');
@@ -333,39 +379,20 @@ function getCellValue(cell, ss) {
   return vM[1] || null;
 }
 
-function transformCell(cell, ss, doPhone) {
-  const col = cell.col, t = cell.t;
+// The cell's style index (used to look up its number format).
+function styleIdx(cell) {
+  const m = cell.attrStr.match(/\bs="(\d+)"/);
+  return m ? +m[1] : 0;
+}
 
-  if (t === 's') {
-    const vM = cell.inner.match(/<v[^>]*>(\d+)<\/v>/);
-    if (!vM) return null;
-    const idx = parseInt(vM[1]);
-    if (isNaN(idx) || idx >= ss.length) return null;
-    const old = ss[idx];
-
-    if (col === COL_REP) {
-      const nv = xlClean(old); return nv !== old ? nv : null;
-    }
-    if (CLEAN_COLS.has(col) || PROPER_COLS.has(col)) {
-      let nv = old;
-      if (CLEAN_COLS.has(col)) nv = xlClean(nv);
-      if (PROPER_COLS.has(col)) {
-        nv = xlProper(xlClean(nv));
-        // xlProper lowercases 2nd+ letters of every word, turning "CA" → "Ca".
-        // Re-apply state capitalization so the address keeps the correct abbreviation.
-        nv = capStatesStr(nv);
-      }
-      return nv !== old ? nv : null;
-    }
-  }
-
-  // format-phone: numeric col B
-  if (doPhone && col === COL_PHONE && t !== 's' && t !== 'b' && t !== 'e') {
-    const vM = cell.inner.match(/<v[^>]*>([^<]*)<\/v>/);
-    if (vM && vM[1]) return fmtPhone(vM[1]);
-  }
-
-  return null;
+// Excel "Replace All" of " <code> " → " <CODE> " (case-insensitive, part of
+// cell) for a single, own state code — matches macros_toolkit.py op_capital_states
+// (each sheet fixes only its own 2-letter code, e.g. NY on the NY sheet).
+function capStateOwn(s, code) {
+  if (!s || !code) return s;
+  const find = ` ${code} `;
+  if (!s.toLowerCase().includes(find.toLowerCase())) return s;
+  return s.replace(new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), find);
 }
 
 function inlineCell(cell, newVal) {
@@ -447,13 +474,11 @@ function detectRedRows(sheetXml, fills, cellXfs) {
       if (!red.has(r) && isRed(fillFor(s))) red.add(r);
     }
   }
-  // Per-cell — only flag column G (Rep); other columns (e.g. red Address) must not sort the row.
+  // Per-cell — flag the row when ANY cell is red, matching macros_toolkit.py
+  // _scan_sections (a row is red if any cell carries a pure-red fill).
   const cr = /<c r="([A-Z]+)(\d+)"[^>]*\bs="(\d+)"/g;
   let cm;
   while ((cm = cr.exec(sheetXml))) {
-    let colIdx = 0;
-    for (const ch of cm[1]) colIdx = colIdx * 26 + ch.charCodeAt(0) - 64;
-    if (colIdx !== 7) continue;
     const r=+cm[2], s=+cm[3];
     if (r >= 2 && !red.has(r) && isRed(fillFor(s))) red.add(r);
   }
@@ -475,9 +500,11 @@ function renumberRow(rowXml, oldNum, newNum) {
   return xml;
 }
 
-// Move red rows to the top of sheetData (after header), renumbering rows so
-// Excel respects the new order (the r attribute controls physical placement).
-function moveRedToTop(sheetXml, redRows) {
+// Section-aware red-to-top, matching macros_toolkit.py op_sort_red_to_top:
+// within each dated section (the rows between grey divider rows), red rows move
+// to the top of THAT section; divider rows never move and everything else keeps
+// its relative order (stable). Rows are renumbered so Excel honours the order.
+function moveRedToTop(sheetXml, redRows, dividerRows) {
   if (redRows.size === 0) return sheetXml;
 
   const SD_O = '<sheetData>', SD_C = '</sheetData>';
@@ -488,7 +515,8 @@ function moveRedToTop(sheetXml, redRows) {
   const sd     = sheetXml.slice(sdS + SD_O.length, sdE);
   const after  = sheetXml.slice(sdE);
 
-  const headers = [], reds = [], normals = [];
+  const headers = [];      // rows above the data (kept on top, in order)
+  const body = [];         // { xml, num, isDiv, isRed } for data rows, in order
   let p = 0;
   while (p < sd.length) {
     const r = nextRow(sd, p);
@@ -496,18 +524,31 @@ function moveRedToTop(sheetXml, redRows) {
     const rowXml = sd.slice(r.open, r.end);
     p = r.end;
     const rnM = rowXml.match(/\br="(\d+)"/);
-    const rowNum = rnM ? +rnM[1] : 0;
-    if (rowNum < DATA_START) headers.push([rowXml, rowNum]);
-    else if (redRows.has(rowNum)) reds.push([rowXml, rowNum]);
-    else normals.push([rowXml, rowNum]);
+    const num = rnM ? +rnM[1] : 0;
+    if (num < DATA_START) headers.push([rowXml, num]);
+    else body.push({ xml: rowXml, num, isDiv: dividerRows.has(num), isRed: redRows.has(num) });
   }
+
+  // Reorder within each inter-divider section: red rows first (stable), then the
+  // rest (stable). Divider rows stay put as fixed section boundaries.
+  const ordered = [];
+  let seg = [];
+  const flush = () => {
+    for (const it of seg) if (it.isRed) ordered.push(it);
+    for (const it of seg) if (!it.isRed) ordered.push(it);
+    seg = [];
+  };
+  for (const it of body) {
+    if (it.isDiv) { flush(); ordered.push(it); }
+    else seg.push(it);
+  }
+  flush();
 
   // Renumber every row in its new position so Excel places it correctly.
   const out = [];
   let newNum = 1;
-  for (const [xml, oldNum] of [...headers, ...reds, ...normals]) {
-    out.push(renumberRow(xml, oldNum, newNum++));
-  }
+  for (const [xml, oldNum] of headers) out.push(renumberRow(xml, oldNum, newNum++));
+  for (const it of ordered) out.push(renumberRow(it.xml, it.num, newNum++));
   const lastRow = newNum - 1;
 
   // Update <dimension ref="A1:XN"/> to reflect the new last row so Excel does
@@ -609,7 +650,7 @@ function sheetPaths(wbXml, relsXml) {
 // ── Main ───────────────────────────────────────────────────────────────────
 
 self.onmessage = async (e) => {
-  const { buffer, redBySheet = {} } = e.data;
+  const { buffer, redBySheet = {}, dividerBySheet = {} } = e.data;
   try {
     self.postMessage({ type:'progress', msg:'Loading file…' });
     const zip = await JSZip.loadAsync(buffer);
@@ -633,21 +674,19 @@ self.onmessage = async (e) => {
     }
 
     // ── Shared strings ──────────────────────────────────────
+    // Read-only: capital-states is applied per cell (own code) during
+    // processSheet, so shared strings — which are global across every sheet —
+    // are never mutated here.
     const ssFile = zip.file('xl/sharedStrings.xml');
     if (!ssFile) { self.postMessage({ type:'error', message:'No shared strings in this file' }); return; }
+    const ss = parseSharedStrings(await ssFile.async('string'));
 
-    self.postMessage({ type:'progress', msg:'Applying capital states…' });
-    let ssXml = await ssFile.async('string');
-    const ss = parseSharedStrings(ssXml);
-    const ssChanged = applyCapStates(ss);
-    for (const [i, v] of ssChanged) ss[i] = v;
-    if (ssChanged.size > 0) zip.file('xl/sharedStrings.xml', rebuildSSXml(ssXml, ssChanged));
-
-    // ── Styles (for red-row detection) ─────────────────────
+    // ── Styles (for red-row detection + date-formatted phone guard) ────────
     const stylesXml = await zip.file('xl/styles.xml').async('string');
-    const fills     = parseFills(stylesXml);
-    const cellXfs   = parseCellXfs(stylesXml);
-    const redDxfIds = parseDxfRedIds(stylesXml); // for conditional-formatting detection
+    const fills       = parseFills(stylesXml);
+    const cellXfs     = parseCellXfs(stylesXml);
+    const redDxfIds   = parseDxfRedIds(stylesXml); // for conditional-formatting detection
+    const dateStyleIds = dateStyleIndexSet(stylesXml);
 
     // ── Sheet paths ─────────────────────────────────────────
     const wbXml   = await zip.file('xl/workbook.xml').async('string');
@@ -670,10 +709,17 @@ self.onmessage = async (e) => {
       const redRows = (passed && passed.length > 0)
         ? new Set(passed)
         : new Set([...detectRedRows(xml, fills, cellXfs), ...detectCFRedRows(xml, redDxfIds, ss)]);
+      // Section boundaries for the red-to-top sort: reuse the divider rows the
+      // display worker already found; fall back to local detection.
+      const passedDiv = dividerBySheet[state];
+      const dividerRows = (passedDiv && passedDiv.length > 0)
+        ? new Set(passedDiv)
+        : detectDividerRows(xml, ss);
       const doP = NO_RI_NH.includes(state);
-      // Clean/dedupe/phone transforms, then move red rows to top with renumbering.
-      let out = processSheet(xml, ss, doP, doP);
-      out = moveRedToTop(out, redRows);
+      // Clean / capital-states / dedupe / phone, then red rows to the top of
+      // each dated section (with renumbering).
+      let out = processSheet(xml, ss, state, doP, doP, dateStyleIds);
+      out = moveRedToTop(out, redRows, dividerRows);
       // Fix every stale range reference created by the above transforms.
       out = await fixSheetMeta(zip, path, out);
       zip.file(path, out);

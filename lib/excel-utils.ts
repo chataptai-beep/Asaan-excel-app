@@ -1,4 +1,3 @@
-import * as XLSX from "xlsx";
 import { SheetData, WorkbookData } from "./types";
 
 export function parseWorkbook(
@@ -32,13 +31,7 @@ export function parseWorkbook(
   });
 }
 
-export function exportWorkbook(sheets: SheetData[], fileName: string): void {
-  const wb = XLSX.utils.book_new();
-  for (const sheet of sheets) {
-    const aoa = [sheet.headers, ...sheet.rows.map((r) => r.cells)];
-    const ws = XLSX.utils.aoa_to_sheet(aoa);
-    XLSX.utils.book_append_sheet(wb, ws, sheet.name);
-  }
-  const base = fileName.replace(/\.[^/.]+$/, "");
-  XLSX.writeFile(wb, `${base}_processed.xlsx`);
-}
+// NOTE: exporting is done by public/export.worker.js, which edits the workbook
+// XML in place so every fill / font / border / conditional-format survives (the
+// same guarantee as macros_toolkit.py). A values-only aoa_to_sheet export used
+// to live here; it was removed because it silently discarded all formatting.

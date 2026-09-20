@@ -62,16 +62,11 @@ function detectRedInXml(xml, fills, cellXfs) {
     let m;
     while ((m = re.exec(xml))) { const r=+m[1],s=+m[2]; if (!red.has(r)&&isRed(fillFor(s))) red.add(r); }
   }
-  // Per-cell — only flag the row when column G (the Rep column) is red.
-  // Other columns (e.g. Address in column F) sometimes carry red fills for
-  // different reasons and should not trigger a row sort.
+  // Per-cell — flag the row when ANY cell carries a red fill, matching
+  // macros_toolkit.py _scan_sections (a row is red if any cell is pure red).
   let cm;
   const cr = /<c r="([A-Z]+)(\d+)"[^>]*\bs="(\d+)"/g;
   while ((cm = cr.exec(xml))) {
-    // Convert column letters to 1-based index (A=1, G=7, …)
-    let colIdx = 0;
-    for (const ch of cm[1]) colIdx = colIdx * 26 + ch.charCodeAt(0) - 64;
-    if (colIdx !== 7) continue; // only column G
     const r=+cm[2], s=+cm[3];
     if (r>=2 && !red.has(r) && isRed(fillFor(s))) red.add(r);
   }

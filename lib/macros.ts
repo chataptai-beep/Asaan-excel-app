@@ -7,12 +7,17 @@ export function excelClean(value: CellValue): CellValue {
   return value.split("").filter((ch) => ch.charCodeAt(0) >= 32).join("");
 }
 
+// A "letter" is any Unicode letter (matches Python str.isalpha()), so accented
+// names like "maría" → "María" (not "MaríA"). ASCII-only detection wrongly
+// treats accented chars as separators and mis-capitalizes the following letter.
+const LETTER_RE = /\p{L}/u;
+
 export function excelProper(value: CellValue): CellValue {
   if (typeof value !== "string") return value;
   let result = "";
   let prevIsLetter = false;
   for (const ch of value) {
-    if (/[a-zA-Z]/.test(ch)) {
+    if (LETTER_RE.test(ch)) {
       result += prevIsLetter ? ch.toLowerCase() : ch.toUpperCase();
       prevIsLetter = true;
     } else {
@@ -72,18 +77,38 @@ function dedupeKey(cells: CellValue[]): string {
 
 // ---- Operations ----
 
+function sortKeyBlank(v: CellValue): boolean {
+  return v === null || v === undefined || String(v).trim() === "";
+}
+
 export function sortRows(rows: RowData[], descending: boolean): { rows: RowData[]; changed: number } {
+  // Mirrors macros_toolkit.py op_sort (macros 2/6/7): Excel Sort of the whole
+  // data range by column E, "sort text that looks numeric as a number", stable,
+  // blank keys always at the bottom (both directions). Divider rows are NOT
+  // special-cased — Excel's own Sort moves them inline by their key, exactly as
+  // the recording did (the section concept only applies to sort-red-top).
   const col = COL.E;
-  const sorted = [...rows].sort((a, b) => {
-    if (a.isDivider !== b.isDivider) return a.isDivider ? -1 : 1;
-    if (a.isDivider && b.isDivider) return 0;
-    const av = a.cells[col] ?? "";
-    const bv = b.cells[col] ?? "";
-    const an = toNumber(av); const bn = toNumber(bv);
-    let cmp = (an !== null && bn !== null) ? an - bn : String(av).localeCompare(String(bv));
+  const decorated = rows.map((r, i) => ({ r, i }));
+  decorated.sort((a, b) => {
+    const av = a.r.cells[col];
+    const bv = b.r.cells[col];
+    const ab = sortKeyBlank(av);
+    const bb = sortKeyBlank(bv);
+    if (ab || bb) {
+      if (ab && bb) return a.i - b.i;      // both blank → keep original order
+      return ab ? 1 : -1;                  // blanks sink to the bottom, asc or desc
+    }
+    const an = toNumber(av);
+    const bn = toNumber(bv);
+    let cmp: number;
+    if (an !== null && bn !== null) cmp = an < bn ? -1 : an > bn ? 1 : 0;
+    else if (an !== null) cmp = -1;        // numbers sort before text (ascending)
+    else if (bn !== null) cmp = 1;
+    else cmp = String(av).localeCompare(String(bv));
+    if (cmp === 0) return a.i - b.i;       // stable tie-break
     return descending ? -cmp : cmp;
   });
-  return { rows: sorted, changed: data(rows).length };
+  return { rows: decorated.map((d) => d.r), changed: data(rows).length };
 }
 
 export function cleanRep(rows: RowData[]): { rows: RowData[]; changed: number } {
@@ -253,10 +278,13 @@ export function applyMacro(
       out = moveRedToTop(rows);
       return { rows: out.rows, result: { op, changed: out.changed, message: `Red rows moved to top: ${out.changed} row(s)` } };
     case "run-all": {
-      // Run the full pipeline: clean → dedupe → format phone → capital states → move red to top
+      // macros_toolkit.py RUN_ALL_SEQUENCE = clean-rep, clean-proper,
+      // capital-states, dedupe, format-phone (sort is deliberately left out).
+      // move-red-top is the app's own final step (the toolkit runs sort-red-top
+      // as a separate command); it mirrors what export.worker.js writes.
       let r = rows;
       let totalChanged = 0;
-      const steps: MacroOp[] = ["clean-proper", "clean-rep", "remove-outliers", "capital-states", "dedupe", "format-phone", "move-red-top"];
+      const steps: MacroOp[] = ["clean-rep", "clean-proper", "capital-states", "dedupe", "format-phone", "move-red-top"];
       for (const step of steps) {
         const res = applyMacro(r, step, sheetName);
         r = res.rows;
