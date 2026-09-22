@@ -569,7 +569,7 @@ function moveRedToTop(sheetXml, redRows, dividerRows, ss) {
     seg = [];
   };
   for (const it of body) {
-    if (it.isDiv) { flush(); ordered.push(it); }
+    if (it.isDiv) { flush(); ordered.push({ spacer: true }); ordered.push(it); }
     else seg.push(it);
   }
   flush();
@@ -577,8 +577,13 @@ function moveRedToTop(sheetXml, redRows, dividerRows, ss) {
   // Renumber every row in its new position so Excel places it correctly.
   const out = [];
   let newNum = 1;
+  let lastDivRow = 0;
   for (const [xml, oldNum] of headers) out.push(renumberRow(xml, oldNum, newNum++));
-  for (const it of ordered) out.push(renumberRow(it.xml, it.num, newNum++));
+  for (const it of ordered) {
+    if (it.spacer) { out.push(`<row r="${newNum++}"/>`); continue; }
+    if (it.isDiv) lastDivRow = newNum;
+    out.push(renumberRow(it.xml, it.num, newNum++));
+  }
   const lastRow = newNum - 1;
 
   // Update <dimension ref="A1:XN"/> to reflect the new last row so Excel does
@@ -589,7 +594,27 @@ function moveRedToTop(sheetXml, redRows, dividerRows, ss) {
     return `<dimension ref="A1:${lastCol}${lastRow}"`;
   });
 
-  return updatedBefore + out.join('') + after;
+  return setOpeningScroll(updatedBefore, lastDivRow) + out.join('') + after;
+}
+
+// Park the sheet's saved view on the newest section so the workbook opens there
+// instead of at row 1. The scroll position lives in topLeftCell — on <pane> when
+// a frozen header exists, otherwise on <sheetView>. The cell must stay inside
+// <dimension>, or Excel reports the file as damaged on open.
+function setOpeningScroll(beforeXml, row) {
+  if (!row) return beforeXml;
+  const cell = `A${row}`;
+  const setAttr = (tag, attr, val) =>
+    new RegExp(`\\b${attr}="`).test(tag)
+      ? tag.replace(new RegExp(`\\b${attr}="[^"]*"`), `${attr}="${val}"`)
+      : tag.replace(/^<([\w:]+)/, `<$1 ${attr}="${val}"`);
+
+  let out = /<pane\b/.test(beforeXml)
+    ? beforeXml.replace(/<pane\b[^>]*?\/?>/, (t) => setAttr(t, 'topLeftCell', cell))
+    : beforeXml.replace(/<sheetView\b[^>]*?>/, (t) => setAttr(t, 'topLeftCell', cell));
+
+  return out.replace(/<selection\b[^>]*?\/?>/g, (t) =>
+    setAttr(setAttr(t, 'activeCell', cell), 'sqref', cell));
 }
 
 // ── Post-process sheet XML to fix stale references ─────────────────────────
