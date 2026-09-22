@@ -49,6 +49,14 @@ function fmtPhone(raw) {
   return (n < 0 ? '-' : '') + out.join('');
 }
 
+// Lead number in column E: last run of digits — "2834" → 2834, "1,620" → 1620,
+// "4.17.26 LEAD / 1966" → 1966. Non-numeric → null.
+function leadNumber(v) {
+  if (v == null) return null;
+  const m = String(v).replace(/,/g, '').match(/\d+/g);
+  return m ? parseInt(m[m.length - 1], 10) : null;
+}
+
 // ── XML helpers ────────────────────────────────────────────────────────────
 
 function escXml(s) {
@@ -370,6 +378,12 @@ function parseCells(rowBody) {
 }
 
 function getCellValue(cell, ss) {
+  // Cells this worker already rewrote are inline strings (<is><t>…</t></is>);
+  // read those too so a later pass (e.g. the column-E sort) sees the new value.
+  if (cell.t === 'inlineStr') {
+    const m = cell.inner.match(/<t[^>]*>([\s\S]*?)<\/t>/);
+    return m ? unescXml(m[1]) : null;
+  }
   const vM = cell.inner.match(/<v[^>]*>([^<]*)<\/v>/);
   if (!vM) return null;
   if (cell.t === 's') {
@@ -500,13 +514,12 @@ function renumberRow(rowXml, oldNum, newNum) {
   return xml;
 }
 
-// Section-aware red-to-top, matching macros_toolkit.py op_sort_red_to_top:
-// within each dated section (the rows between grey divider rows), red rows move
-// to the top of THAT section; divider rows never move and everything else keeps
-// its relative order (stable). Rows are renumbered so Excel honours the order.
-function moveRedToTop(sheetXml, redRows, dividerRows) {
-  if (redRows.size === 0) return sheetXml;
-
+// Section-aware sort, following macros_toolkit.py op_sort_red_to_top plus the
+// requested column-E ordering: within each dated section (rows between grey
+// divider rows), red rows go on top, then the rest — BOTH groups sorted by the
+// column-E lead number, descending. Divider rows never move; rows are renumbered
+// so Excel honours the order.
+function moveRedToTop(sheetXml, redRows, dividerRows, ss) {
   const SD_O = '<sheetData>', SD_C = '</sheetData>';
   const sdS = sheetXml.indexOf(SD_O), sdE = sheetXml.lastIndexOf(SD_C);
   if (sdS === -1 || sdE === -1) return sheetXml;
@@ -516,8 +529,8 @@ function moveRedToTop(sheetXml, redRows, dividerRows) {
   const after  = sheetXml.slice(sdE);
 
   const headers = [];      // rows above the data (kept on top, in order)
-  const body = [];         // { xml, num, isDiv, isRed } for data rows, in order
-  let p = 0;
+  const body = [];         // { xml, num, isDiv, isRed, lead, i } for data rows
+  let p = 0, i = 0;
   while (p < sd.length) {
     const r = nextRow(sd, p);
     if (!r) break;
@@ -525,17 +538,34 @@ function moveRedToTop(sheetXml, redRows, dividerRows) {
     p = r.end;
     const rnM = rowXml.match(/\br="(\d+)"/);
     const num = rnM ? +rnM[1] : 0;
-    if (num < DATA_START) headers.push([rowXml, num]);
-    else body.push({ xml: rowXml, num, isDiv: dividerRows.has(num), isRed: redRows.has(num) });
+    if (num < DATA_START) { headers.push([rowXml, num]); continue; }
+    // Column E (index 5) lead number for sorting.
+    let lead = null;
+    if (!r.selfClose) {
+      for (const c of parseCells(sd.slice(r.bodyStart, r.bodyEnd))) {
+        if (c.col === 5) { lead = leadNumber(getCellValue(c, ss)); break; }
+      }
+    }
+    body.push({ xml: rowXml, num, isDiv: dividerRows.has(num), isRed: redRows.has(num), lead, i: i++ });
   }
 
-  // Reorder within each inter-divider section: red rows first (stable), then the
-  // rest (stable). Divider rows stay put as fixed section boundaries.
+  // Descending by lead number, blank/non-numeric last, stable for ties.
+  const byLeadDesc = (a, b) => {
+    if (a.lead === null || b.lead === null) {
+      if (a.lead === null && b.lead === null) return a.i - b.i;
+      return a.lead === null ? 1 : -1;
+    }
+    return a.lead !== b.lead ? b.lead - a.lead : a.i - b.i;
+  };
+
+  // Reorder within each inter-divider section: sorted reds, then sorted rest.
+  // Divider rows stay put as fixed section boundaries.
   const ordered = [];
   let seg = [];
   const flush = () => {
-    for (const it of seg) if (it.isRed) ordered.push(it);
-    for (const it of seg) if (!it.isRed) ordered.push(it);
+    const reds = seg.filter((it) => it.isRed).sort(byLeadDesc);
+    const rest = seg.filter((it) => !it.isRed).sort(byLeadDesc);
+    ordered.push(...reds, ...rest);
     seg = [];
   };
   for (const it of body) {
@@ -719,7 +749,7 @@ self.onmessage = async (e) => {
       // Clean / capital-states / dedupe / phone, then red rows to the top of
       // each dated section (with renumbering).
       let out = processSheet(xml, ss, state, doP, doP, dateStyleIds);
-      out = moveRedToTop(out, redRows, dividerRows);
+      out = moveRedToTop(out, redRows, dividerRows, ss);
       // Fix every stale range reference created by the above transforms.
       out = await fixSheetMeta(zip, path, out);
       zip.file(path, out);

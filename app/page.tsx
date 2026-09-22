@@ -2,7 +2,7 @@
 
 import { useCallback, useState, useRef, useMemo } from "react";
 import { parseWorkbook } from "@/lib/excel-utils";
-import { applyMacro } from "@/lib/macros";
+import { applyMacro, moveRedToTop } from "@/lib/macros";
 import {
   MacroOp, MacroResult, RowData, SheetData,
   VISIBLE_COLS, COLUMN_LABELS, WorkbookData, KNOWN_STATES,
@@ -191,10 +191,9 @@ export default function Home() {
         return sortDir === "asc" ? cmp : -cmp;
       });
     } else {
-      // Default view mirrors the export: red rows first, original order preserved
-      // within each group. Partitioning keeps this O(n) over ~84k rows.
-      const red = rows.filter((r) => r.isRed);
-      if (red.length) rows = [...red, ...rows.filter((r) => !r.isRed)];
+      // Default view mirrors the export exactly: per divider section, red rows on
+      // top then the rest, both groups sorted by the column-E lead number desc.
+      rows = moveRedToTop(rows).rows;
     }
     return rows;
   }, [currentSheet, search, sortCol, sortDir]);

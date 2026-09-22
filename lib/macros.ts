@@ -213,15 +213,40 @@ export function removeOutliers(rows: RowData[]): { rows: RowData[]; changed: num
   return { rows: result, changed: removed };
 }
 
+// The lead number in column E: the last run of digits, so plain "2834" → 2834,
+// "1,620" → 1620 and a labelled "4.17.26 LEAD / 1966" → 1966. Non-numeric → null.
+export function leadNumber(v: CellValue): number | null {
+  if (v === null || v === undefined) return null;
+  const m = String(v).replace(/,/g, "").match(/\d+/g);
+  return m ? parseInt(m[m.length - 1], 10) : null;
+}
+
+// Sort a group of rows by column-E lead number, descending (large → small),
+// blank/non-numeric keys last, stable for ties.
+function byLeadDesc(rows: RowData[]): RowData[] {
+  return rows
+    .map((r, i) => ({ r, i, lead: leadNumber(r.cells[COL.E]) }))
+    .sort((a, b) => {
+      if (a.lead === null || b.lead === null) {
+        if (a.lead === null && b.lead === null) return a.i - b.i;
+        return a.lead === null ? 1 : -1;
+      }
+      if (a.lead !== b.lead) return b.lead - a.lead;
+      return a.i - b.i;
+    })
+    .map((x) => x.r);
+}
+
 export function moveRedToTop(rows: RowData[]): { rows: RowData[]; changed: number } {
-  // Split into sections by divider rows, move red rows to top of each section
+  // Within each divider section: red rows on top, then the rest — BOTH groups
+  // sorted by the column-E lead number, descending. Divider rows never move.
   const result: RowData[] = [];
   let section: RowData[] = [];
   let moved = 0;
 
   function flushSection() {
-    const redInSec = section.filter((r) => r.isRed);
-    const normalInSec = section.filter((r) => !r.isRed);
+    const redInSec = byLeadDesc(section.filter((r) => r.isRed));
+    const normalInSec = byLeadDesc(section.filter((r) => !r.isRed));
     moved += redInSec.length;
     result.push(...redInSec, ...normalInSec);
     section = [];
